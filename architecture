@@ -1,0 +1,655 @@
+# Architecture — Akis Store Platform
+
+> Document de référence technique — fusion de `architecture.md` + `saas.md`.
+> Plan d'architecture complet pour la plateforme SaaS de gestion d'entreprise multi-tenant.
+> Voir `akis.md` pour le plan d'implémentation étape par étape.
+
+---
+
+## 1. Vue d'ensemble
+
+**Akis Store** est une plateforme SaaS B2B de gestion d'entreprise tout-en-un ciblant les TPE/PME.  
+Elle couvre : ventes, stock, facturation, RH, caisse, projets, comptabilité (cabinet), et plus.
+
+| Dimension | Choix |
+|---|---|
+| Framework | Next.js 16 App Router (React 19) |
+| Langage | TypeScript strict |
+| Styling | TailwindCSS 4 + shadcn/ui + Radix UI |
+| BDD | PostgreSQL via Prisma ORM |
+| Auth | Supabase Auth (JWT) |
+| Stockage fichiers | Supabase Storage |
+| API interne | Hono RPC (type-safe) |
+| State / cache | TanStack React Query v5 |
+| Temps réel | Supabase Realtime (WebSocket) |
+| Rate limiting | Upstash Redis |
+| Email | Resend |
+| Monitoring erreurs | Sentry |
+| PDF | jsPDF + jsPDF-autotable |
+| Charts | Recharts |
+| Import/Export | XLSX |
+| Formulaires | React Hook Form + Zod v4 |
+| Éditeur texte | Tiptap |
+| QR Code | html5-qrcode |
+| Package manager | pnpm (workspace) |
+| Déploiement | Vercel (standalone Docker possible) |
+| Tests unitaires | Vitest |
+| Tests e2e | Playwright |
+| Storybook | Storybook 10 (composants) |
+| Perf | Lighthouse CI |
+
+---
+
+## 2. Structure du projet
+
+```
+
+├── app/                          # Next.js App Router
+│   ├── (auth)/                   # Routes publiques auth (connexion, inscription)
+│   ├── (site)/                   # Landing page marketing
+│   ├── (demo)/demo/              # Mode démo (données fictives)
+│   ├── (main)/dashboard/         # App protégée (toutes les routes métier)
+│   │   └── layout.tsx            # Layout principal (sidebar, header, auth guard)
+│   ├── api/[[...route]]/         # Catch-all Hono RPC handler
+│   ├── auth/                     # Callback Supabase OAuth
+│   ├── generated/prisma/         # Client Prisma généré
+│   ├── layout.tsx                # Root layout (providers, themes, i18n)
+│   └── globals.css               # Variables CSS globales + Tailwind
+│
+├── core/
+│   ├── features/                 # Modules métier (feature-first)
+│   │   └── [module]/
+│   │       ├── hooks/            # React Query hooks (useXxx)
+│   │       ├── queries/          # Fonctions Prisma (server-side)
+│   │       ├── routes/           # Hono route handlers
+│   │       ├── view/             # Composants React (pages, modals, tables)
+│   │       ├── types.ts          # Types TypeScript du module
+│   │       ├── zod/              # Schémas de validation Zod
+│   │       └── index.ts          # Exports publics du module
+│   │
+│   ├── components/
+│   │   ├── global/               # Composants partagés (Sidebar, Header, Onboarding...)
+│   │   ├── pages/                # Layouts de page génériques
+│   │   └── ui/                   # Primitives UI (shadcn/ui wrappés)
+│   │
+│   ├── hooks/                    # Hooks globaux (realtime, widget config, notifs...)
+│   ├── lib/                      # Utilitaires, config, constantes
+│   ├── middleware/               # Middlewares Hono (auth, pack-guard, rate-limit...)
+│   ├── providers/                # Context providers React (theme, locale, query...)
+│   └── i18n/                     # Traductions (fr, ar, en)
+│
+├── prisma/
+│   ├── schema.prisma             # Schéma de base de données complet
+│   ├── seed.ts                   # Données de seed (démo)
+│   └── migrations/               # Migrations SQL
+│
+├── public/                       # Assets statiques
+├── supabase/                     # Config Supabase local
+ 
+├── next.config.ts                # Config Next.js (CSP, Sentry, images)
+├── vercel.json                   # Config déploiement Vercel
+└── .env                          # Variables d'environnement
+```
+
+---
+
+## 3. Modèle de données (Prisma)
+
+### Multi-tenancy
+
+Chaque entité appartient à un **Store** via `storeId` (UUID). Toutes les requêtes filtrent par `storeId` — isolation totale des données entre tenants.
+ 
+### Patterns communs
+- **Soft-delete** : `deletedAt DateTime?` sur la quasi-totalité des modèles
+- **UUID v4** : `gen_random_uuid()` côté PostgreSQL (pas de séquences)
+- **Index composites** : `[storeId, createdAt]`, `[storeId, statut]` pour les requêtes fréquentes
+- **Énumérations** : `ModePaiement`, `CreditStatut`, `MouvementType` en enums Prisma
+
+---
+
+ 
+## 6. Système de permissions (RBAC)
+
+### Rôles
+- **owner / admin** → accès total
+- **gerant, caissier, vendeur, rh** → accès total à leurs routes assignées
+- **membre** → accès granulaire défini par `access[]` et `routes[]`
+
+### Format des permissions membres
+```
+access: ["clients | view", "clients | create", "ventes | view", "ventes | create"]
+routes: ["clients", "ventes"]
+```
+
+### Actions disponibles
+`view` · `create` · `update` · `delete` · `reset` · `details`  `ajuste si c'est necessaire`
+
+### Implémentation
+- Permissions stockées en BDD sur `Membre.access[]`
+- Cachées dans des **cookies non-httpOnly** (`akis_membre_*`) pour accès JS côté client
+- Vérifiées dans le layout via `definePermissions()` de `core/lib/permissions.ts`
+- Routes bloquées → redirection automatique vers la première route autorisée
+
+---
+
+## 7. Couche API (Hono RPC)
+
+```
+app/api/[[...route]]/route.ts   ← handler Next.js catch-all
+         ↓
+   AppType (export)             ← inférence TypeScript pour le client
+         ↓
+core/features/[module]/routes/  ← routes Hono par module
+         ↓
+core/middleware/
+  ├── session-middleware.ts     → vérifie JWT Supabase (auth)
+  ├── store-guard.ts            → vérifie appartenance store
+  ├── pack-guard.ts             → vérifie limites de pack
+  ├── rate-limiter.ts           → Upstash Redis rate limit
+  └── api-key-middleware.ts     → auth par clé API publique
+```
+
+### Client RPC (frontend)
+```typescript
+// core/lib/rpc.ts
+export const client = hc<AppType>(baseUrl, {
+  fetch: async (input, init) => {
+    // Injecte automatiquement le Bearer token Supabase
+    headers.set("Authorization", `Bearer ${token}`);
+    // Auto-logout sur 401
+  }
+});
+```
+
+---
+
+## 8. Flux d'authentification
+
+```
+1. User → /connexion
+2. Supabase Auth (email/password ou magic link)
+3. JWT stocké par Supabase (localStorage + cookie)
+4. Middleware Next.js (proxy.ts) → vérifie cookie `akis_session`
+5. Si manager → récupère store via /api/stores/me
+6. Si membre → charge access[] + routes[] → cookie akis_membre_*
+7. Layout → route guard + sidebar filtrée
+```
+
+---
+
+## 9. Temps réel (Supabase Realtime)
+
+Le hook `useStoreRealtimeSubscriptions` écoute les tables :
+- `commandes` → alerte nouvelle commande
+- `stock` → alerte stock critique
+- `activity_logs` → synchronisation activité
+
+Les `useNotificationToast` affiche des toasts Sonner à chaque nouvelle `Notification` en BDD.
+
+---
+
+## 10. Sécurité
+
+| Mesure | Détail |
+|---|---|
+| CSP strict | `script-src 'self'`, pas d'`unsafe-eval` en prod |
+| HSTS | `max-age=63072000; includeSubDomains; preload` |
+| X-Frame-Options | `DENY` (anti-clickjacking) |
+| Rate limiting | Upstash Redis, par IP + par store |
+| Soft-delete | Données jamais supprimées physiquement |
+| API Keys | Hashées en BDD, prefix visible `ak_live_xxxx` |
+| Audit log | Toute action CRUD tracée dans `ActivityLog` |
+| Sentry | Monitoring erreurs + source maps supprimées après upload |
+
+---
+
+## 11. Internationalisation (i18n)
+
+- 3 locales : `fr` (défaut), `ar`, `en`
+- Fichiers JSON dans `core/lib/locales/`
+- Fonction `t(key, locale)` depuis `core/lib/i18n.ts`
+- Locale stockée dans un Context provider `locale-provider`
+- Support RTL pour l'arabe
+
+--- 
+
+
+## 13. Variables d'environnement requises
+
+```env
+# Supabase
+NEXT_PUBLIC_SUPABASE_URL=
+NEXT_PUBLIC_SUPABASE_ANON_KEY=
+SUPABASE_SERVICE_ROLE_KEY=
+
+# Database
+DATABASE_URL=
+
+# App
+NEXT_PUBLIC_APP_URL=
+
+# Upstash Redis (rate limiting)
+UPSTASH_REDIS_REST_URL=
+UPSTASH_REDIS_REST_TOKEN=
+
+# Email
+RESEND_API_KEY=
+ 
+# WhatsApp (optionnel)
+WHATSAPP_API_KEY=
+```
+
+---
+
+## 15. Guide complet — Comment les données sont récupérées
+
+### Vue d'ensemble de la chaîne de données
+
+```
+PostgreSQL (DB)
+    ↑↓  pg driver
+Prisma 7  (ORM — server only)
+    ↑↓  queries/
+Hono  (API — /api/[[...route]])
+    ↑  middlewares: Supabase JWT → storeGuard → packGuard → rateLimit
+    ↓  JSON response
+RPC client (hono/client — type-safe fetch)
+    ↑↓
+TanStack Query  (cache + state client)
+    ↓
+React Component → TanStack Table (rendu)
+```
+
+---
+
+### 15.1 PostgreSQL + Prisma 7
+
+**Rôle :** accès direct à la base de données — uniquement côté serveur.
+
+**Initialisation du client (`core/lib/prisma.ts`) :**
+```ts
+import { PrismaClient } from "@/app/generated/prisma/client";
+import { PrismaPg } from "@prisma/adapter-pg";
+
+const globalForPrisma = globalThis as { prisma: PrismaClient };
+
+function createPrismaClient() {
+  const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL! });
+  return new PrismaClient({ adapter });
+}
+
+export const prisma = globalForPrisma.prisma || createPrismaClient();
+// Singleton en dev pour éviter les connexions multiples (hot-reload)
+if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
+```
+
+**Points clés :**
+- Utilise `@prisma/adapter-pg` (driver natif pg) au lieu du driver Rust par défaut → compatible Edge/Vercel
+- Singleton pattern pour éviter la multiplication des connexions en dev (hot-reload Next.js)
+- Schéma généré dans `app/generated/prisma/` (non `.prisma/client` standard)
+- Toutes les requêtes filtrent **obligatoirement** par `storeId` (multi-tenancy)
+- Soft-delete : `deletedAt: null` dans tous les `where`
+
+**Exemple de query (`core/features/ventes/queries/vente-q.ts`) :**
+```ts
+export const getVentesByStore = async (storeId: string, page = 1, limit = 50) => {
+  const offset = (page - 1) * limit;
+  const [rows, total] = await Promise.all([
+    prisma.vente.findMany({
+      where: { storeId, deletedAt: null },       // ← filtre tenant + soft-delete
+      include: { items: { include: { produit: true } }, client: true }, // ← joins
+      orderBy: { createdAt: "desc" },
+      skip: offset, take: limit,                  // ← pagination
+    }),
+    prisma.vente.count({ where: { storeId, deletedAt: null } }),
+  ]);
+  return { rows, total, page, pageSize: limit, hasMore: offset + limit < total };
+};
+```
+
+**Transactions atomiques :**
+```ts
+return prisma.$transaction(async (tx) => {
+  // 1. Vérif stock
+  // 2. Créer la vente + items
+  // 3. Décrémenter stock
+  // 4. Créer MouvementStock
+  // Tout ou rien — rollback auto si exception
+});
+```
+
+**Validation Zod côté serveur (dans les queries) :**
+```ts
+export const CreateVenteSchema = z.object({
+  storeId: z.string().min(1),
+  items: z.array(ItemVenteSchema).min(1),
+  modePaiement: z.enum(["especes", "mobile_dmoney", "mobile_waafi"]).optional(),
+  // ...
+});
+// La query revalide les données avant d'écrire en BDD
+const validation = CreateVenteSchema.safeParse(data);
+if (!validation.success) throw new Error(...);
+```
+
+---
+
+### 15.2 Supabase — Auth uniquement
+
+**Supabase n'est PAS utilisé pour lire les données métier.** Son rôle est strictement :
+- **Authentification** : gestion des JWT (login, register, refresh, logout)
+- **Storage** : upload de fichiers (logos, documents GED)
+- **Realtime** : WebSocket pour les subscriptions temps réel
+
+**Deux clients distincts :**
+
+| Client | Fichier | Usage |
+|---|---|---|
+| Browser (anon key) | `core/lib/supabase/client.ts` | Login/logout côté client, Realtime |
+| Admin (service role) | `core/lib/supabase/server.ts` | Vérification JWT dans les middlewares Hono |
+
+```ts
+// Server — vérifie le token JWT Supabase (middleware session)
+const supabase = getSupabaseAdmin();
+const { data, error } = await supabase.auth.getUser(token);
+// → extrait userId + userEmail → injecté dans c.set("userId", user.id)
+
+// Browser — login/logout client
+const supabase = getSupabaseBrowser();
+const { data } = await supabase.auth.getSession();
+```
+
+---
+
+### 15.3 Hono — Couche API
+
+**Rôle :** framework HTTP ultra-léger qui tourne à l'intérieur du handler Next.js `app/api/[[...route]]/route.ts`.
+
+**Architecture :**
+```
+Next.js Handler (GET/POST/PATCH/PUT/DELETE)
+    └── Hono app (basePath: /api)
+            ├── Middlewares globaux (ordre d'exécution)
+            │   ├── cors()                → CORS multi-origin
+            │   ├── logger()              → logs requêtes
+            │   ├── errorHandler()        → catch global
+            │   ├── apiRateLimiter        → Upstash Redis (100 req/min)
+            │   ├── strictRateLimiter     → /auth/* (anti-bruteforce)
+            │   ├── sessionMiddleware     → vérifie JWT Supabase → set userId
+            │   ├── storeGuardMiddleware  → vérifie accès au store demandé
+            │   └── packGuardMiddleware   → vérifie limites du pack (starter/business/pro)
+            │
+            └── Routes par module
+                ├── /ventes     → vente.route.ts
+                ├── /produits   → produit.route.ts
+                ├── /clients    → client.route.ts
+                └── ... (38 modules)
+```
+
+**Type-safety du bout en bout via `AppType` :**
+```ts
+// route.ts — exporte le type de toutes les routes
+const routes = app.route("/ventes", venteRoute).route("/clients", clientRoute)...
+export type AppType = typeof routes;  // ← type inféré de toutes les routes
+```
+
+**Exemple de route Hono :**
+```ts
+const app = new Hono()
+  .get("/store/:storeId",
+    zValidator("query", z.object({ page: z.string().optional() })),
+    async (c) => {
+      const { storeId } = c.req.param();          // param URL typé
+      const { page } = c.req.valid("query");       // query validée par Zod
+      const data = await getVentesByStore(storeId, Number(page || 1));
+      return c.json({ data });                     // réponse JSON typée
+    }
+  )
+  .post("/",
+    zValidator("json", CreateVenteSchema),
+    async (c) => {
+      const body = c.req.valid("json");            // body validé par Zod
+      const data = await createVente(body);
+      await logFromContext(c, { action: "create", entity: "vente" }); // audit
+      return c.json({ data }, 201);
+    }
+  );
+```
+
+**Middleware `sessionMiddleware` — flux d'authentification :**
+```
+Request → Authorization: Bearer <supabase_jwt>
+    → supabase.auth.getUser(token)
+    → c.set("userId", user.id)
+    → c.set("userEmail", user.email)
+    → next()  |  throw 401 si token invalide
+```
+
+**Middleware `storeGuardMiddleware` — isolation tenant :**
+```
+storeId dans URL param ou body
+    → Fast path: JWT user_metadata.storeId == storeId → OK
+    → Slow path: DB check (owner / manager / membre)
+    → throw 403 si accès refusé
+```
+
+---
+
+### 15.4 RPC Client — Pont type-safe ( example de comment c'est implémenté)
+
+**Rôle :** remplace `fetch()` brut par un client typé qui connaît toutes les routes Hono.
+
+**Fichier `core/lib/rpc.ts` :**
+```ts
+import { hc } from "hono/client";
+import type { AppType } from "@/app/api/[[...route]]/route";
+
+export const client = hc<AppType>(baseUrl, {
+  async fetch(input, init) {
+    const token = await getToken(); // récupère le JWT Supabase depuis le cache
+    const headers = new Headers(init?.headers);
+    if (token) headers.set("Authorization", `Bearer ${token}`);
+
+    const res = await fetch(input, { ...init, headers });
+
+    // Auto-logout si 401
+    if (res.status === 401 && !isSigningOut) {
+      await supabase.auth.signOut();
+      window.location.href = "/connexion";
+    }
+    return res;
+  },
+});
+```
+
+**Utilisation dans les hooks — URL typée (pas de string magic) :**
+```ts
+// ✅ Type-safe — l'IDE connaît les paramètres et la réponse
+const res = await client.api.ventes.store[":storeId"].$get({
+  param: { storeId },
+  query: { page: "1", limit: "50" },
+});
+
+// ✅ Mutation
+const res = await client.api.ventes.$post({ json: venteData });
+
+// ✅ Patch avec param
+const res = await client.api.ventes[":id"].$patch({ param: { id }, json: data });
+```
+
+---
+
+### 15.5 TanStack Query — Cache et état client
+
+**Rôle :** cache des données, gestion loading/error, invalidation automatique après mutations.
+
+**Pattern standard — hook de lecture :**
+```ts
+export const useVentesByStore = (storeId: string | undefined) => {
+  return useQuery({
+    queryKey: ["ventes", "store", storeId],   // clé de cache unique
+    queryFn: async () => {
+      if (!storeId) return [];
+      const res = await client.api.ventes.store[":storeId"].$get({
+        param: { storeId }, query: {},
+      });
+      if (!res.ok) throw new Error("Erreur récupération");
+      const json = await res.json();
+      return json.data?.rows ?? json.data;
+    },
+    enabled: !!storeId,   // ne s'exécute que si storeId est défini
+  });
+};
+```
+
+**Pattern standard — hook de mutation :**
+```ts
+export const useCreateVente = () => {
+  const queryClient = useQueryClient();
+  const mutation = useMutation({
+    mutationFn: async (data) => {
+      const res = await client.api.ventes.$post({ json: data });
+      if (!res.ok) throw new Error(extractApiError(await res.json()));
+      return res.json();
+    },
+    onSuccess: () => {
+      // Invalide les caches concernés → re-fetch automatique
+      queryClient.invalidateQueries({ queryKey: ["ventes"] });
+      queryClient.invalidateQueries({ queryKey: ["stock"] });
+      queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+    },
+  });
+  return mutation.mutateAsync; // exposé directement (pas l'objet mutation)
+};
+```
+
+**Pagination infinie (`useInfinitePaginated`) :**
+```ts
+export const usePaginatedVentes = (storeId, limit = 50) => {
+  return useInfinitePaginated<Vente>(
+    ["ventes", "paginated", storeId, limit],
+    async (page) => {
+      const res = await client.api.ventes.store[":storeId"].$get({
+        param: { storeId: storeId! },
+        query: { page: String(page), limit: String(limit) },
+      });
+      const json = await res.json();
+      return json.data; // { rows, total, page, pageSize, hasMore }
+    },
+    { enabled: !!storeId, pageSize: limit },
+  );
+};
+// Retourne : { results, status, loadMore }
+```
+
+**Hiérarchie des queryKeys :**
+```
+["ventes"]                           → invalide tout le module ventes
+["ventes", "store", storeId]         → liste paginée d'un store
+["ventes", "stats", storeId]         → statistiques
+["ventes", "detail", id]             → détail d'une vente
+["ventes", "paginated", storeId, 50] → pagination infinie
+```
+
+---
+
+### 15.6 TanStack Table — Rendu des tableaux
+
+**Rôle :** virtualisation, tri, filtrage, pagination côté client sur les données déjà fetchées par TanStack Query.
+
+**Définition des colonnes (`vente-columns.tsx`) :**
+```ts
+import { ColumnDef } from "@tanstack/react-table";
+
+export const VenteColumns = (
+  onRemove?: (id: string) => Promise<void>,
+  T: (k: string) => string = (k) => k
+): ColumnDef<Vente>[] => [
+  {
+    id: "articles",
+    header: T("col.product"),
+    cell: ({ row }) => {
+      const items = row.original.items ?? [];  // données typées
+      return <ItemsCell items={items} />;
+    },
+    size: 250,
+  },
+  {
+    id: "montantTotal",
+    header: T("col.total"),
+    cell: ({ row }) => (
+      <span>{row.original.montantTotal.toLocaleString()} DJF</span>
+    ),
+  },
+  // ...
+];
+```
+
+**Utilisation dans la vue (`vente-body.tsx`) :**
+```ts
+// 1. Fetch via TanStack Query
+const { results: ventes, loadMore } = usePaginatedVentes(storeData?.id);
+
+// 2. Définir les colonnes (mémoïsées)
+const columns = useMemo(() => VenteColumns(canDelete ? handleRemove : undefined, T), [ventes]);
+
+// 3. Rendu via DataTable (composant global wrappant TanStack Table)
+<DataTable columns={columns} data={ventes} onLoadMore={loadMore} />
+```
+
+**`DataTable` (`core/components/global/DataTable.tsx`) wraps :**
+```ts
+useReactTable({
+  data,
+  columns,
+  getCoreRowModel: getCoreRowModel(),
+  getSortedRowModel: getSortedRowModel(),
+  getFilteredRowModel: getFilteredRowModel(),
+})
+```
+
+---
+
+### 15.7 Flux complet — Exemple : afficher la liste des ventes
+
+```
+1. User ouvre /dashboard/ventes
+2. Next.js rend VenteBody (Client Component)
+3. usePaginatedVentes(storeId) s'exécute
+   └── queryKey: ["ventes", "paginated", storeId, 50]
+   └── Cache miss → queryFn s'exécute
+4. client.api.ventes.store[":storeId"].$get(...)
+   └── hono/client construit l'URL : GET /api/ventes/store/{storeId}?page=1&limit=50
+   └── Injecte Authorization: Bearer <supabase_jwt>
+5. Next.js reçoit la requête → route.ts handler
+6. Middlewares Hono en séquence :
+   a. cors() → OK
+   b. apiRateLimiter → vérifie Upstash Redis
+   c. sessionMiddleware → supabase.auth.getUser(token) → userId extrait
+   d. storeGuardMiddleware → vérifie que userId a accès à storeId
+   e. packGuardMiddleware → vérifie limites pack
+7. vente.route.ts handler reçoit la requête
+8. getVentesByStore(storeId, 1, 50) appelé
+9. prisma.vente.findMany({ where: { storeId, deletedAt: null }, ... })
+   └── PrismaPg driver → query SQL → PostgreSQL
+10. Réponse JSON : { rows: Vente[], total, page, hasMore }
+11. TanStack Query met en cache la réponse
+12. React re-render → DataTable affiche les ventes via TanStack Table
+```
+
+---
+ 
+### 15.9 Résumé des responsabilités
+
+| Technologie | Rôle | Où |
+|---|---|---|
+| **PostgreSQL** | Persistance des données | Infrastructure Supabase |
+| **Prisma 7** | ORM, queries, transactions, soft-delete | `core/features/*/queries/` + `core/lib/prisma.ts` |
+| **Supabase Auth** | JWT authentication uniquement | `core/lib/supabase/` + `core/middleware/session-middleware.ts` |
+| **Supabase Storage** | Upload fichiers (logos, GED) | `core/features/dossiers/` |
+| **Supabase Realtime** | Push WebSocket (commandes, stock, notifs) | `core/hooks/use-realtime-subscriptions.ts` |
+| **Hono** | API REST type-safe, middlewares, routing | `app/api/[[...route]]/` + `core/features/*/routes/` |
+| **Zod** | Validation schémas (client + serveur) | `core/features/*/zod/` + dans les queries |
+| **RPC client** | Fetch type-safe (pas de string URLs) | `core/lib/rpc.ts` |
+| **TanStack Query** | Cache, loading, invalidation, mutations | `core/features/*/hooks/` |
+| **TanStack Table** | Rendu tableaux (colonnes, tri, filtre) | `core/features/*/view/*-columns.tsx` |
+| **Upstash Redis** | Rate limiting (100 req/min/IP) | `core/middleware/rate-limiter.ts` |

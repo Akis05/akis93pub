@@ -1,0 +1,13 @@
+packages:
+  - "smpp-bridge"
+
+allowBuilds:
+  '@prisma/client': true
+  '@prisma/engines': true
+  '@sentry/cli': true
+  core-js: true
+  esbuild: true
+  msgpackr-extract: true
+  prisma: true
+  sharp: true
+  unrs-resolver: set this to true or false

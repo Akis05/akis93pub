@@ -1,0 +1,7 @@
+.git
+node_modules
+smpp-bridge/node_modules
+.next
+app/generated
+smpp-bridge/src/generated
+*.log

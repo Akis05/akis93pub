@@ -1,0 +1,530 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../app/generated/prisma"
+}
+
+generator bridge {
+  provider = "prisma-client"
+  output   = "../smpp-bridge/src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ============ ORGANISATION / MULTI-TENANT ============
+
+model Organization {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name      String
+  slug      String    @unique
+  logo      String?
+  timezone  String    @default("Africa/Djibouti")
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  // Relations
+  users      User[]
+  contacts   Contact[]
+  groups     ContactGroup[]
+  messages   SmsMessage[]
+  campaigns  Campaign[]
+  templates  SmsTemplate[]
+  providers  SmsProvider[]
+  senderIds  SenderId[]
+  routes     SmsRoute[]
+  apiKeys    ApiKey[]
+  webhooks   Webhook[]
+  auditLogs  AuditLog[]
+  credits    CreditBalance?
+
+  @@index([slug])
+}
+
+// ============ UTILISATEURS & AUTH ============
+
+model User {
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email          String    @unique
+  name           String?
+  avatar         String?
+  role           UserRole  @default(OPERATOR)
+  permissions    String[]  @default([])
+  organizationId String    @db.Uuid
+  supabaseUserId String    @unique
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  deletedAt      DateTime?
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  apiKeys      ApiKey[]
+  auditLogs    AuditLog[]
+
+  @@index([organizationId])
+  @@index([supabaseUserId])
+}
+
+enum UserRole {
+  SUPER_ADMIN
+  ADMIN
+  OPERATOR
+  DEVELOPER
+  VIEWER
+}
+
+// ============ CONTACTS ============
+
+model Contact {
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  phone          String    // Format E.164
+  firstName      String?
+  lastName       String?
+  country        String?
+  tags           String[]  @default([])
+  customFields   Json?     @default("{}")
+  isBlacklisted  Boolean   @default(false)
+  organizationId String    @db.Uuid
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  deletedAt      DateTime?
+
+  organization Organization       @relation(fields: [organizationId], references: [id])
+  groups       ContactGroupMember[]
+  messages     SmsMessage[]
+
+  @@unique([organizationId, phone])
+  @@index([organizationId, createdAt])
+  @@index([organizationId, phone])
+}
+
+model ContactGroup {
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name           String
+  description    String?
+  color          String?   @default("#3B82F6")
+  isDynamic      Boolean   @default(false)
+  dynamicRules   Json?     // Règles de filtrage pour groupes dynamiques
+  organizationId String    @db.Uuid
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  deletedAt      DateTime?
+
+  organization Organization       @relation(fields: [organizationId], references: [id])
+  members      ContactGroupMember[]
+  campaigns    Campaign[]
+
+  @@unique([organizationId, name])
+  @@index([organizationId])
+}
+
+model ContactGroupMember {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  contactId String   @db.Uuid
+  groupId   String   @db.Uuid
+  addedAt   DateTime @default(now())
+
+  contact Contact      @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  group   ContactGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@unique([contactId, groupId])
+}
+
+// ============ MESSAGES SMS ============
+
+model SmsMessage {
+  id                String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  direction         MessageDirection @default(OUTBOUND)
+  sourceAddr        String           // Sender ID
+  destinationAddr   String           // Numéro destinataire E.164
+  content           String
+  encoding          SmsEncoding      @default(GSM7)
+  segments          Int              @default(1)
+  status            MessageStatus    @default(PENDING)
+  dlrStatus         DlrStatus?
+  dlrReceivedAt     DateTime?
+  dlrErrorCode      String?
+  providerMessageId String?          // message_id retourné par le SMSC
+  sequenceNumber    Int?
+  jobId             String?          // ID du job BullMQ (corrélation file <-> message)
+  providerId        String?          @db.Uuid
+  routeId           String?          @db.Uuid
+  campaignId        String?          @db.Uuid
+  contactId         String?          @db.Uuid
+  templateId        String?          @db.Uuid
+  scheduledAt       DateTime?
+  sentAt            DateTime?
+  deliveredAt       DateTime?
+  cost              Decimal?         @db.Decimal(10, 4)
+  metadata          Json?            @default("{}")
+  organizationId    String           @db.Uuid
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  organization Organization  @relation(fields: [organizationId], references: [id])
+  provider     SmsProvider?  @relation(fields: [providerId], references: [id])
+  route        SmsRoute?     @relation(fields: [routeId], references: [id])
+  campaign     Campaign?     @relation(fields: [campaignId], references: [id])
+  contact      Contact?      @relation(fields: [contactId], references: [id])
+  template     SmsTemplate?  @relation(fields: [templateId], references: [id])
+
+  @@index([organizationId, createdAt])
+  @@index([organizationId, status])
+  @@index([providerMessageId])
+  @@index([organizationId, providerMessageId])
+  @@index([campaignId])
+}
+
+enum MessageDirection {
+  INBOUND  // MO - Mobile Originated
+  OUTBOUND // MT - Mobile Terminated
+}
+
+enum SmsEncoding {
+  GSM7
+  UCS2
+}
+
+enum MessageStatus {
+  PENDING
+  QUEUED
+  SENDING
+  SENT
+  DELIVERED
+  FAILED
+  EXPIRED
+  REJECTED
+  CANCELLED
+}
+
+enum DlrStatus {
+  DELIVRD  // Livré
+  EXPIRED  // Expiré
+  UNDELIV  // Non livré
+  REJECTD  // Rejeté
+  ACCEPTD  // Accepté (intermédiaire)
+  UNKNOWN  // Inconnu
+}
+
+// ============ TEMPLATES ============
+
+model SmsTemplate {
+  id             String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name           String
+  content        String
+  variables      String[]         @default([]) // Liste des variables: ["firstName", "code"]
+  category       TemplateCategory @default(TRANSACTIONAL)
+  isActive       Boolean          @default(true)
+  organizationId String           @db.Uuid
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  deletedAt      DateTime?
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  messages     SmsMessage[]
+  campaigns    Campaign[]
+
+  @@unique([organizationId, name])
+  @@index([organizationId])
+}
+
+enum TemplateCategory {
+  OTP
+  MARKETING
+  TRANSACTIONAL
+  ALERT
+  NOTIFICATION
+}
+
+// ============ CAMPAGNES ============
+
+model Campaign {
+  id              String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name            String
+  description     String?
+  status          CampaignStatus @default(DRAFT)
+  senderId        String?        @db.Uuid
+  templateId      String?        @db.Uuid
+  message         String?        // Message personnalisé si pas de template
+  scheduledAt     DateTime?
+  startedAt       DateTime?
+  completedAt     DateTime?
+  pausedAt        DateTime?
+  totalRecipients Int            @default(0)
+  sentCount       Int            @default(0)
+  deliveredCount  Int            @default(0)
+  failedCount     Int            @default(0)
+  organizationId  String         @db.Uuid
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+  deletedAt       DateTime?
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  senderIdRef  SenderId?    @relation(fields: [senderId], references: [id])
+  template     SmsTemplate? @relation(fields: [templateId], references: [id])
+  messages     SmsMessage[]
+  groups       ContactGroup[]
+
+  @@index([organizationId, status])
+  @@index([organizationId, createdAt])
+}
+
+enum CampaignStatus {
+  DRAFT
+  SCHEDULED
+  RUNNING
+  PAUSED
+  COMPLETED
+  CANCELLED
+}
+
+// ============ INFRASTRUCTURE SMPP ============
+
+// Note: the SMPP connection is configured exclusively via .env variables
+// (SMPP_*). There is intentionally no DB-backed connector model.
+
+model SmsProvider {
+  id             String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name           String
+  type           ProviderType @default(SMPP)
+  country        String?      // Code pays ISO
+  isActive       Boolean      @default(true)
+  config         Json?        @default("{}") // Config spécifique au provider
+  organizationId String       @db.Uuid
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  deletedAt      DateTime?
+
+  organization Organization    @relation(fields: [organizationId], references: [id])
+  senderIds    SenderId[]
+  routes       SmsRoute[]
+  messages     SmsMessage[]
+  pricingRules PricingRule[]
+
+  @@unique([organizationId, name])
+  @@index([organizationId])
+}
+
+enum ProviderType {
+  SMPP
+  HTTP_API
+}
+
+model SenderId {
+  id             String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name           String         // Max 11 chars alphanumériques
+  type           SenderIdType   @default(ALPHANUMERIC)
+  status         ApprovalStatus @default(PENDING)
+  approvedAt     DateTime?
+  rejectedReason String?
+  providerId     String?        @db.Uuid
+  organizationId String         @db.Uuid
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  deletedAt      DateTime?
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  provider     SmsProvider? @relation(fields: [providerId], references: [id])
+  campaigns    Campaign[]
+
+  @@unique([organizationId, name])
+  @@index([organizationId])
+}
+
+enum SenderIdType {
+  ALPHANUMERIC // Max 11 chars
+  SHORT_CODE   // Numéro court
+  LONG_CODE    // Numéro long
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model SmsRoute {
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name           String
+  priority       Int       @default(0) // Plus élevé = plus prioritaire
+  isActive       Boolean   @default(true)
+  isDefault      Boolean   @default(false) // Route fallback
+  rules          Json      @default("[]") // Règles de routage
+  providerId     String?   @db.Uuid
+  organizationId String    @db.Uuid
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  deletedAt      DateTime?
+
+  organization Organization   @relation(fields: [organizationId], references: [id])
+  provider     SmsProvider?   @relation(fields: [providerId], references: [id])
+  messages     SmsMessage[]
+
+  @@index([organizationId, priority])
+}
+
+// ============ API & WEBHOOKS ============
+
+model ApiKey {
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name           String
+  keyHash        String    @unique // SHA-256 du token
+  keyPrefix      String    // Préfixe visible: "ak_live_xxxx"
+  scopes         String[]  @default(["sms:send", "sms:read"])
+  expiresAt      DateTime?
+  lastUsedAt     DateTime?
+  ipWhitelist    String[]  @default([])
+  rateLimit      Int       @default(100) // Requêtes par minute
+  userId         String    @db.Uuid
+  organizationId String    @db.Uuid
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  revokedAt      DateTime?
+
+  user         User         @relation(fields: [userId], references: [id])
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@index([organizationId])
+  @@index([keyHash])
+}
+
+model Webhook {
+  id              String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name            String
+  url             String
+  secret          String    // Pour signature HMAC-SHA256
+  events          String[]  @default([]) // ["sms.delivered", "sms.failed"]
+  isActive        Boolean   @default(true)
+  retryPolicy     Json      @default("{\"maxRetries\": 5, \"backoffMs\": 1000}")
+  failureCount    Int       @default(0)
+  lastTriggeredAt DateTime?
+  lastSuccessAt   DateTime?
+  lastFailureAt   DateTime?
+  organizationId  String    @db.Uuid
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  deletedAt       DateTime?
+
+  organization Organization      @relation(fields: [organizationId], references: [id])
+  deliveries   WebhookDelivery[]
+
+  @@index([organizationId])
+}
+
+model WebhookDelivery {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  webhookId   String    @db.Uuid
+  event       String
+  payload     Json
+  statusCode  Int?
+  response    String?
+  latencyMs   Int?
+  attempts    Int       @default(1)
+  deliveredAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  webhook Webhook @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+
+  @@index([webhookId, createdAt])
+}
+
+// ============ FACTURATION ============
+
+model CreditBalance {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  balance        Decimal  @db.Decimal(12, 4) @default(0)
+  alertThreshold Decimal? @db.Decimal(12, 4)
+  organizationId String   @unique @db.Uuid
+  updatedAt      DateTime @updatedAt
+
+  organization Organization        @relation(fields: [organizationId], references: [id])
+  transactions CreditTransaction[]
+}
+
+model CreditTransaction {
+  id           String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  type         TransactionType
+  amount       Decimal         @db.Decimal(12, 4)
+  balanceAfter Decimal         @db.Decimal(12, 4)
+  description  String?
+  reference    String?         // ID de message, facture, etc.
+  balanceId    String          @db.Uuid
+  createdAt    DateTime        @default(now())
+
+  balance CreditBalance @relation(fields: [balanceId], references: [id])
+
+  @@index([balanceId, createdAt])
+}
+
+enum TransactionType {
+  CREDIT     // Achat de crédits
+  DEBIT      // Consommation (envoi SMS)
+  REFUND     // Remboursement
+  ADJUSTMENT // Ajustement manuel
+}
+
+model PricingRule {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name            String
+  country         String?  // Code pays ISO ou null pour défaut
+  prefix          String?  // Préfixe numéro ou null
+  pricePerSms     Decimal  @db.Decimal(10, 4)
+  pricePerSegment Decimal? @db.Decimal(10, 4)
+  providerId      String   @db.Uuid
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  provider SmsProvider @relation(fields: [providerId], references: [id])
+
+  @@index([providerId])
+  @@index([country, prefix])
+}
+
+// ============ AUDIT & NOTIFICATIONS ============
+
+model AuditLog {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  action         String   // "create", "update", "delete", "login", etc.
+  entity         String   // "sms", "campaign", "user", etc.
+  entityId       String?
+  userId         String?  @db.Uuid
+  userEmail      String?
+  ipAddress      String?
+  userAgent      String?
+  details        Json?    @default("{}") // Diff avant/après
+  organizationId String   @db.Uuid
+  createdAt      DateTime @default(now())
+
+  user         User?        @relation(fields: [userId], references: [id])
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@index([organizationId, createdAt])
+  @@index([organizationId, entity])
+  @@index([userId])
+}
+
+model Notification {
+  id        String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  type      NotificationType
+  title     String
+  message   String
+  data      Json?            @default("{}")
+  isRead    Boolean          @default(false)
+  userId    String           @db.Uuid
+  createdAt DateTime         @default(now())
+  readAt    DateTime?
+
+  @@index([userId, isRead])
+  @@index([userId, createdAt])
+}
+
+enum NotificationType {
+  INFO
+  WARNING
+  ERROR
+  SUCCESS
+  CONNECTOR_DOWN
+  CREDITS_LOW
+  CAMPAIGN_COMPLETED
+  DLR_ALERT
+}
